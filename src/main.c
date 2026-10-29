@@ -3,17 +3,24 @@
 //
 //    - Liest jede Sekunde den TMP112 (I2C, Adresse 0x48) aus
 //    - Zeigt Temperatur und die empfangenen Rohdaten (binaer) auf dem ILI9488 Display an
+//    - Sendet das Paket (Gray Code) als QAM-4 ueber den MCP4802 Dual-DAC:
+//        DAC A = I-Anteil  I * cos(wt)
+//        DAC B = Q-Anteil  Q * sin(wt)
+//      Fuer den Demodulator (ein ADC-Eingang) beide Ausgaenge ueber je einen Widerstand
+//      (z.B. 2x 10k) zusammenfuehren -> I*cos + Q*sin. Alternativ QAM_DAC_A_SUMME = 1 setzen.
 //
 //    Pins laut https://juventus-technikerschule-hf.github.io/eduboard2/docs/hw-baseboard
 /********************************************************************************************* */
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
+#include "esp_timer.h"
 
 // ---------------- Pins ----------------
 #define PIN_I2C_SDA     2
@@ -24,6 +31,10 @@
 #define PIN_LCD_CS      11
 #define PIN_LCD_DC      16
 #define PIN_LCD_RESET   8
+
+// MCP4802 haengt am gleichen SPI Bus wie das Display (MOSI 13, SCK 14)
+#define PIN_DAC_CS      3       // geteilt mit Flash_CS (Flash normalerweise nicht bestueckt)
+#define PIN_DAC_LDAC    10      // geteilt mit SD_CS -> keine SD Karte einstecken
 
 #define TMP112_ADDR     0x48
 #define TMP112_REG_TEMP 0x00
@@ -38,8 +49,43 @@
 // Daraus wird die Startsequenz gewaehlt (abwechselndes Bitmuster, gut erkennbar).
 #define PACKET_START    0xA5A   // 1010 0101 1010 = 165.6 C -> kein gueltiger Messwert
 
+// ---------------- QAM-4 Parameter (muessen zum Demodulator passen) ----------------
+// Traeger 1 kHz, 4 Perioden pro Symbol -> 250 Symbole/s, 2 Bit/Symbol -> 500 bit/s
+#define CARRIER_HZ              1000
+#define CARRIER_CYCLES_SYMBOL   4
+// Ausgaberate 32 kS/s: pro Sample 2 SPI Transfers, das reicht zeitlich sicher.
+// Der Empfaenger tastet trotzdem mit 64 kS/s ab (die Treppenstufen stoeren die 1 kHz Korrelation nicht).
+#define DAC_SAMPLES_PER_CARRIER 32
+#define DAC_SAMPLE_RATE_HZ      (CARRIER_HZ * DAC_SAMPLES_PER_CARRIER)
+#define DAC_SAMPLES_PER_SYMBOL  (DAC_SAMPLES_PER_CARRIER * CARRIER_CYCLES_SYMBOL)
+
+#define PREAMBLE_SYMBOLS        8       // 00,11,00,11,... zur Synchronisation des Empfaengers
+#define PAYLOAD_SYMBOLS         18      // 36 Bit START|DATA|CHECK / 2 Bit pro Symbol
+
+#define DAC_MID                 128     // Arbeitspunkt: Mitte des 8 Bit DAC (1.024 V bei Gain 1x)
+#define DAC_AMPLITUDE           85      // I*cos + Q*sin erreicht max. sqrt(2) * 85 = 120 -> kein Clipping
+
+// 0: DAC A = I*cos, DAC B = Q*sin
+// 1: DAC A = I*cos + Q*sin (fertiges QAM Signal direkt auf den ADC), DAC B = Q*sin
+#define QAM_DAC_A_SUMME         0
+
+// MCP4802 Kommandowort: Bit 15 = Kanal, Bit 13 = Gain 1x, Bit 12 = Ausgang aktiv, Bit 11..4 = Daten
+#define MCP4802_DAC_A           0x0000
+#define MCP4802_DAC_B           0x8000
+#define MCP4802_GAIN_1X         0x2000
+#define MCP4802_ACTIVE          0x1000
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static i2c_master_dev_handle_t tmp112;
 static spi_device_handle_t lcd;
+static spi_device_handle_t dac;
+
+// Traegertabellen fuer eine Periode, bereits mit DAC_AMPLITUDE skaliert
+static int8_t carrier_cos[DAC_SAMPLES_PER_CARRIER];
+static int8_t carrier_sin[DAC_SAMPLES_PER_CARRIER];
 
 // ---------------- Temperatursensor ----------------
 static void tmp112_init(void)
@@ -232,6 +278,98 @@ static packet_t build_packet(uint16_t value12)
     return p;
 }
 
+// ---------------- DAC MCP4802 / QAM-4 Modulator ----------------
+static void dac_write_channel(uint16_t channel, uint8_t value)
+{
+    uint16_t word = channel | MCP4802_GAIN_1X | MCP4802_ACTIVE | ((uint16_t)value << 4);
+    spi_transaction_t t = {
+        .flags = SPI_TRANS_USE_TXDATA,
+        .length = 16,
+        .tx_data = { word >> 8, word & 0xFF },
+    };
+    spi_device_polling_transmit(dac, &t);
+}
+
+// Schreibt beide Kanaele und uebernimmt sie mit dem LDAC Puls gleichzeitig an die Ausgaenge
+static void dac_write(uint8_t a, uint8_t b)
+{
+    dac_write_channel(MCP4802_DAC_A, a);
+    dac_write_channel(MCP4802_DAC_B, b);
+    gpio_set_level(PIN_DAC_LDAC, 0);
+    gpio_set_level(PIN_DAC_LDAC, 1);
+}
+
+static void dac_init(void)
+{
+    gpio_set_direction(PIN_DAC_LDAC, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_DAC_LDAC, 1);
+
+    spi_device_interface_config_t dev_cfg = {
+        .clock_speed_hz = 20 * 1000 * 1000,     // MCP4802 max. 20 MHz
+        .mode = 0,
+        .spics_io_num = PIN_DAC_CS,
+        .queue_size = 1,
+    };
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &dac));     // Bus wurde in lcd_init erstellt
+
+    for (int n = 0; n < DAC_SAMPLES_PER_CARRIER; n++) {
+        float phase = 2.0f * (float)M_PI * n / DAC_SAMPLES_PER_CARRIER;
+        carrier_cos[n] = (int8_t)lroundf(DAC_AMPLITUDE * cosf(phase));
+        carrier_sin[n] = (int8_t)lroundf(DAC_AMPLITUDE * sinf(phase));
+    }
+    dac_write(DAC_MID, DAC_MID);    // kein Traeger bis zum ersten Paket
+}
+
+// Sendet Preamble + Paket als QAM-4. Mapping: Bit 1 -> I, Bit 0 -> Q (0 = -1, 1 = +1)
+//   00 -> I=-1 Q=-1,  01 -> I=-1 Q=+1,  10 -> I=+1 Q=-1,  11 -> I=+1 Q=+1
+// Blockiert (8 + 18) Symbole * 4 ms = 104 ms. Rueckgabe: Anzahl zu spaet ausgegebener Samples
+static int qam_send_packet(const packet_t *p)
+{
+    uint8_t symbols[PREAMBLE_SYMBOLS + PAYLOAD_SYMBOLS];
+    int count = 0;
+
+    for (int k = 0; k < PREAMBLE_SYMBOLS; k++) {
+        symbols[count++] = (k % 2) ? 0x3 : 0x0;
+    }
+
+    // 36 Bit START|DATA|CHECK, hoechstwertige Bits zuerst (so setzt der Empfaenger das Paket zusammen)
+    uint64_t frame = ((uint64_t)p->start << 24) | ((uint64_t)p->data << 12) | p->check;
+    for (int s = PAYLOAD_SYMBOLS - 1; s >= 0; s--) {
+        symbols[count++] = (frame >> (2 * s)) & 0x3;
+    }
+
+    // Bus fuer die ganze Ausgabe reservieren -> Display wartet, SPI Transfers werden schneller
+    spi_device_acquire_bus(dac, portMAX_DELAY);
+
+    int late = 0;
+    uint32_t n = 0;
+    int64_t t0 = esp_timer_get_time();
+
+    for (int k = 0; k < count; k++) {
+        int i = (symbols[k] & 0x2) ? 1 : -1;
+        int q = (symbols[k] & 0x1) ? 1 : -1;
+
+        // Jedes Symbol beginnt bei Traegerphase 0 (ganze Anzahl Perioden pro Symbol)
+        for (int m = 0; m < DAC_SAMPLES_PER_SYMBOL; m++, n++) {
+            int i_part = i * carrier_cos[m % DAC_SAMPLES_PER_CARRIER];
+            int q_part = q * carrier_sin[m % DAC_SAMPLES_PER_CARRIER];
+#if QAM_DAC_A_SUMME
+            dac_write(DAC_MID + i_part + q_part, DAC_MID + q_part);
+#else
+            dac_write(DAC_MID + i_part, DAC_MID + q_part);
+#endif
+            // Auf den naechsten Abtastzeitpunkt warten (absolut ab t0 gerechnet -> kein Driften)
+            int64_t next = t0 + ((int64_t)(n + 1) * 1000000) / DAC_SAMPLE_RATE_HZ;
+            if (esp_timer_get_time() > next) late++;
+            while (esp_timer_get_time() < next) { }
+        }
+    }
+
+    dac_write(DAC_MID, DAC_MID);    // Traeger aus -> Pause, damit der Empfaenger neu triggert
+    spi_device_release_bus(dac);
+    return late;
+}
+
 // ---------------- Task ----------------
 static void temperature_task(void *arg)
 {
@@ -273,7 +411,13 @@ static void temperature_task(void *arg)
         snprintf(line, sizeof(line), "HEX   %03X/%03X/%03X", p.start, p.data, p.check);
         lcd_text(10, 300, line);
 
-        printf("Temp: %.4f C  Paket (Gray): %03X/%03X/%03X\n", temp, p.start, p.data, p.check);
+        int late = qam_send_packet(&p);
+        lcd_text(10, 335, "QAM-4 GESENDET");
+        snprintf(line, sizeof(line), "SPAETE SAMPLES %-5d", late);
+        lcd_text(10, 360, line);
+
+        printf("Temp: %.4f C  Paket (Gray): %03X/%03X/%03X  QAM-4 gesendet, %d Samples zu spaet\n",
+               temp, p.start, p.data, p.check, late);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -283,6 +427,8 @@ void app_main()
     lcd_init();
     lcd_clear();
     tmp112_init();
+    dac_init();
 
-    xTaskCreate(temperature_task, "temperature", 4096, NULL, 5, NULL);
+    // Core 1: die Sample-Ausgabe wartet aktiv und soll moeglichst nicht unterbrochen werden
+    xTaskCreatePinnedToCore(temperature_task, "temperature", 4096, NULL, 5, NULL, 1);
 }
